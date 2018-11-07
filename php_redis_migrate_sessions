@@ -20,15 +20,30 @@ php_session_dir=/var/lib/php5
 # this is the php session prefix inside redis
 php_session_prefix=PHPREDIS_SESSION
 
-# this is what happens during the find loop underneath
-# when the script is called with php session file as parameter
-# it outputs the redis protocol for mass insertion
-if test -n "$1" -a -f "$1"; then
-    # generate the session id cause we need to get the length of it
-    session_id=$php_session_prefix:$(basename ${1/sess_/})
-    echo -n -e "*3\r\n\$3\r\nSET\r\n\$${#session_id}\r\n$session_id\r\n\$$(stat -c"%s" $1)\r\n$(sed 's/\\/\\\\/g' $1)\r\n"
-    exit 0
-fi
+function echoRedisProtocolInsertSession() {
+    local sessionFileName="$1"
+
+    if test -n "$sessionFileName" -a -f "$sessionFileName"; then
+        # generate the session id cause we need to get the length of it
+        session_id=$php_session_prefix:$(basename ${1/sess_/})
+        echo -n -e "*3\r\n"               # *<args>
+        echo -n -e "\$3\r\n"              # $<len arg0>
+        echo -n -e "SET\r\n"              # <arg0> (command)
+        echo -n -e "\$${#session_id}\r\n" # $<len arg1>
+        echo -n -e "$session_id\r\n"      # <arg1=key>
+        echo -n -e "\$$(echo -n -e "$(escapeValue "$sessionFileName")"| wc -c)\r\n"     # $<len arg2>
+        echo -n -e "$(escapeValue "$sessionFileName")\r\n"                              # <arg2=value>
+    fi
+}
+function escapeValue() {
+    local sessionFileName="$1"
+
+    echo -n -e "$(sed 's/\\/\\\\/g' $sessionFileName | sed 's/\x00/\\\\x00/g')"
+}
+
+export -f echoRedisProtocolInsertSession
+export -f escapeValue
+export php_session_prefix
 
 # trap method to cleanup on exit
 trap cleanexit EXIT
@@ -43,15 +58,14 @@ cleanexit () {
 tmp_dir=`mktemp -d`
 
 # first cleanup all zero byte sessions
-find $php_session_dir -size 0 -exec rm -f {} \;
+echo "removing empty session files"
+find $php_session_dir -type f -size 0 -name "sess_*" -exec rm -f {} \; 2>/dev/null
 
-# then generate the data file with redis protocol for
-# for mass insertion http://redis.io/topics/mass-insert
-# during the find loop we call ourselves with a file as first param
-# this is basically to have everything in a single script
-find $php_session_dir -type f -exec $0 {} \; > $tmp_dir/data.txt
+echo "generating the data file with redis protocol for mass insertion"
+#http://redis.io/topics/mass-insert
+find $php_session_dir -type f -name "sess_*" -exec bash -c 'echoRedisProtocolInsertSession "$0"' {} \; > $tmp_dir/data.txt 2>/dev/null
 
-# load data into redis using the redis-cli pipe mode
+echo "loading data into redis using the redis-cli pipe mode"
 cat $tmp_dir/data.txt | redis-cli --pipe
 
 # exit gracefully
